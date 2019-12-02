@@ -208,7 +208,11 @@ func eatLines(scan *bufio.Scanner, prefix string, n int) error {
 		if !scan.Scan() {
 			return io.ErrUnexpectedEOF
 		}
-		if !bytes.HasPrefix(scan.Bytes(), bprefix) {
+		// diff can inject comments in lines beginning with a backslash, like when
+		// highlighting that the original line had no trailing newline
+		if bytes.HasPrefix(scan.Bytes(), []byte("\\ ")) {
+			i--
+		} else if !bytes.HasPrefix(scan.Bytes(), bprefix) {
 			return fmt.Errorf("line %q does not have expected prefix %q", scan.Bytes(), bprefix)
 		}
 	}
