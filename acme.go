@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -11,10 +12,12 @@ import (
 	"9fans.net/go/acme"
 )
 
+var nl = []byte("\n")
+
 // We would use io.Copy except for a bug in acme
 // where it crashes when reading trying to read more
 // than the negotiated 9P message size.
-func copyBody(w io.Writer, win *acme.Win) error {
+func copyBody(w io.Writer, win *acme.Win) (endsWithNL bool, err error) {
 	buf := make([]byte, 8000)
 	for {
 		n, err := win.Read("body", buf)
@@ -22,13 +25,19 @@ func copyBody(w io.Writer, win *acme.Win) error {
 			break
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
-		if _, err := w.Write(buf[0:n]); err != nil {
-			return fmt.Errorf("write error: %v", err)
+		if _, err := w.Write(buf[:n]); err != nil {
+			return false, fmt.Errorf("write error: %v", err)
+		}
+		endsWithNL = bytes.HasSuffix(buf[:n], nl)
+	}
+	if !endsWithNL {
+		if _, err := w.Write(nl); err != nil {
+			return false, fmt.Errorf("write error: %v", err)
 		}
 	}
-	return nil
+	return endsWithNL, nil
 }
 
 func acmeCurrentWin() (*acme.Win, error) {

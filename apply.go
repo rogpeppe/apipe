@@ -46,7 +46,8 @@ func Main() error {
 	if err != nil {
 		return err
 	}
-	if err := copyBody(bodyFile, win); err != nil {
+	endsWithNL, err := copyBody(bodyFile, win)
+	if err != nil {
 		return err
 	}
 	bodyFile.Seek(0, 0)
@@ -76,7 +77,7 @@ func Main() error {
 	//		return err
 	//	}
 	//	defer win.Write("ctl", []byte("mark"))
-	err = apply(diffOut, func(addr string, data []byte) error {
+	edit := func(addr string, data []byte) error {
 		if _, err := win.Write("addr", []byte(addr)); err != nil {
 			return fmt.Errorf("cannot set address %q: %v", addr, err)
 		}
@@ -84,9 +85,12 @@ func Main() error {
 			return fmt.Errorf("cannot write data: %v", err)
 		}
 		return nil
-	})
-	if err != nil {
+	}
+	if err := apply(diffOut, edit); err != nil {
 		return err
+	}
+	if !endsWithNL {
+		return edit(`$-/\n/`, nil)
 	}
 	return nil
 }
