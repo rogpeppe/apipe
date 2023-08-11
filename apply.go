@@ -71,12 +71,13 @@ func Main() error {
 	if err := pcmd.Start(); err != nil {
 		return fmt.Errorf("cannot start %q: %v", cmdArgs[0], err)
 	}
-	// TODO this doesn't appear to have the desired effect -
-	// changes made after "nomark" don't seem to be undoable.
-	//	if _, err := win.Write("ctl", []byte("nomark")); err != nil {
-	//		return err
-	//	}
-	//	defer win.Write("ctl", []byte("mark"))
+	if _, err := win.Write("ctl", []byte("mark")); err != nil {
+		return err
+	}
+	if _, err := win.Write("ctl", []byte("nomark")); err != nil {
+		return err
+	}
+	defer win.Write("ctl", []byte("mark"))
 	edit := func(addr string, data []byte) error {
 		if _, err := win.Write("addr", []byte(addr)); err != nil {
 			return fmt.Errorf("cannot set address %q: %v", addr, err)
