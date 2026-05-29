@@ -11,18 +11,15 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
-	"regexp"
-	"strconv"
 	"unicode/utf8"
 
 	"9fans.net/go/acme"
+
+	"github.com/rogpeppe/apipe/internal/diff"
 )
 
 func main() {
@@ -42,41 +39,18 @@ func Main() error {
 		return err
 	}
 	defer win.CloseFiles()
-	bodyFile, err := ioutil.TempFile("", "")
-	if err != nil {
+	var body bytes.Buffer
+	if err := copyBody(&body, win); err != nil {
 		return err
 	}
-	if err := copyBody(bodyFile, win); err != nil {
-		return err
-	}
-	bodyFile.Seek(0, 0)
 	pcmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	pcmd.Stdin = bodyFile
+	pcmd.Stdin = bytes.NewReader(body.Bytes())
 	pcmd.Stderr = os.Stderr
-
-	cmd := exec.Command("diff", bodyFile.Name(), "-")
-	cmd.Stdin, err = pcmd.StdoutPipe()
+	newBody, err := pcmd.Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot run %q: %v", cmdArgs[0], err)
 	}
-	cmd.Stderr = os.Stderr
-	diffOut, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("cannot start diff: %v", err)
-	}
-	if err := pcmd.Start(); err != nil {
-		return fmt.Errorf("cannot start %q: %v", cmdArgs[0], err)
-	}
-	// TODO this doesn't appear to have the desired effect -
-	// changes made after "nomark" don't seem to be undoable.
-	//	if _, err := win.Write("ctl", []byte("nomark")); err != nil {
-	//		return err
-	//	}
-	//	defer win.Write("ctl", []byte("mark"))
-	err = apply(diffOut, func(addr string, data []byte) error {
+	return applyDiff(body.Bytes(), newBody, func(addr string, data []byte) error {
 		if _, err := win.Write("addr", []byte(addr)); err != nil {
 			return fmt.Errorf("cannot set address %q: %v", addr, err)
 		}
@@ -85,10 +59,6 @@ func Main() error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func writeData(win *acme.Win, data []byte) error {
@@ -130,163 +100,29 @@ func trimIncompleteRune(b []byte) []byte {
 	return b[0:lastStart]
 }
 
-func quote(s string) string {
-	s = strconv.Quote(s)
-	return s[1 : len(s)-1]
-}
+// applyDiff computes a byte-level diff between old and new, then calls
+// edit for each change with an acme address and the replacement data.
+func applyDiff(old, new []byte, edit func(addr string, data []byte) error) error {
+	edits := diff.Bytes(old, new)
 
-var cmdPat = regexp.MustCompile(`^([0-9]+)(,([0-9]+))?([acd])([0-9]+)(,([0-9]+))?$`)
+	runeAdj := 0
+	bytePos := 0
+	runePos := 0
+	for _, e := range edits {
+		runePos += utf8.RuneCount(old[bytePos:e.Start])
+		oldRuneCount := utf8.RuneCount(old[e.Start:e.End])
+		newRuneCount := utf8.RuneCountInString(e.New)
+		bytePos = e.End
 
-type diffOp struct {
-	n1, n2, n3, n4 int
-	op             rune
-}
-
-// skipNoNewline consumes a "\ No newline at end of file" line
-// if present, returning true if one was found.
-func (s *lineScanner) skipNoNewline() bool {
-	if !s.scan() {
-		return false
-	}
-	if bytes.Equal(s.bytes(), noNewlineMarker) {
-		return true
-	}
-	s.unscan()
-	return false
-}
-
-func apply(diffOut io.Reader, edit func(addr string, data []byte) error) error {
-	scan := &lineScanner{s: bufio.NewScanner(diffOut)}
-	var buf []byte
-	offset := 0
-	for scan.scan() {
-		op, err := parseDiffOp(scan.text())
-		if err != nil {
+		adjStart := runePos + runeAdj
+		adjEnd := adjStart + oldRuneCount
+		addr := fmt.Sprintf("#%d,#%d", adjStart, adjEnd)
+		if err := edit(addr, []byte(e.New)); err != nil {
 			return err
 		}
-		if op.op == 'c' || op.op == 'd' {
-			if err := eatLines(scan, "< ", op.n2-op.n1+1); err != nil {
-				return err
-			}
-			scan.skipNoNewline()
-		}
-		if op.op == 'c' {
-			if err := eatLines(scan, "---", 1); err != nil {
-				return err
-			}
-		}
-		buf = buf[:0]
-		if op.op != 'd' {
-			for i := op.n3; i <= op.n4; i++ {
-				if !scan.scan() {
-					return io.ErrUnexpectedEOF
-				}
-				line := scan.bytes()
-				if !bytes.HasPrefix(line, []byte("> ")) {
-					return fmt.Errorf("expected line starting with '> ', got %q", line)
-				}
-				buf = append(buf, line[2:]...)
-				buf = append(buf, '\n')
-			}
-			if scan.skipNoNewline() {
-				buf = buf[:len(buf)-1]
-			}
-		}
-		var addr string
-		if op.n1 == op.n2 {
-			addr = fmt.Sprintf("%d", op.n1+offset)
-			if op.op == 'a' {
-				addr += "+#0"
-			}
-		} else {
-			addr = fmt.Sprintf("%d,%d", op.n1+offset, op.n2+offset)
-			if op.op == 'a' {
-				return fmt.Errorf("append with multiple line source")
-			}
-		}
-		if err := edit(addr, buf); err != nil {
-			return err
-		}
-		switch op.op {
-		case 'a':
-			offset += op.n4 - op.n3 + 1
-		case 'd':
-			offset -= op.n2 - op.n1 + 1
-		case 'c':
-			offset += (op.n4 - op.n3 + 1) - (op.n2 - op.n1 + 1)
-		}
+
+		runePos += oldRuneCount
+		runeAdj += newRuneCount - oldRuneCount
 	}
 	return nil
 }
-
-func eatLines(scan *lineScanner, prefix string, n int) error {
-	bprefix := []byte(prefix)
-	for i := 0; i < n; i++ {
-		if !scan.scan() {
-			return io.ErrUnexpectedEOF
-		}
-		if !bytes.HasPrefix(scan.bytes(), bprefix) {
-			return fmt.Errorf("line %q does not have expected prefix %q", scan.bytes(), bprefix)
-		}
-	}
-	return nil
-}
-
-func parseDiffOp(cmd string) (diffOp, error) {
-	var op diffOp
-	r := cmdPat.FindStringSubmatch(cmd)
-	if len(r) == 0 {
-		return op, fmt.Errorf("%q is not a valid diff operation", cmd)
-	}
-	op.n1 = atoi(r[1])
-	if r[3] != "" {
-		op.n2 = atoi(r[3])
-	} else {
-		op.n2 = op.n1
-	}
-	op.op = rune(r[4][0])
-	op.n3 = atoi(r[5])
-	if r[7] != "" {
-		op.n4 = atoi(r[7])
-	} else {
-		op.n4 = op.n3
-	}
-	return op, nil
-}
-
-func atoi(s string) int {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		panic(fmt.Errorf("unexpected bad number %q", s))
-	}
-	return n
-}
-
-// lineScanner wraps bufio.Scanner with one-line pushback,
-// needed to handle diff's "\ No newline at end of file" markers.
-type lineScanner struct {
-	s       *bufio.Scanner
-	pending bool
-}
-
-func (s *lineScanner) scan() bool {
-	if s.pending {
-		s.pending = false
-		return true
-	}
-	return s.s.Scan()
-}
-
-func (s *lineScanner) unscan() {
-	s.pending = true
-}
-
-func (s *lineScanner) bytes() []byte {
-	return s.s.Bytes()
-}
-
-func (s *lineScanner) text() string {
-	return s.s.Text()
-}
-
-var noNewlineMarker = []byte(`\ No newline at end of file`)
