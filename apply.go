@@ -142,12 +142,25 @@ type diffOp struct {
 	op             rune
 }
 
+// skipNoNewline consumes a "\ No newline at end of file" line
+// if present, returning true if one was found.
+func (s *lineScanner) skipNoNewline() bool {
+	if !s.scan() {
+		return false
+	}
+	if bytes.Equal(s.bytes(), noNewlineMarker) {
+		return true
+	}
+	s.unscan()
+	return false
+}
+
 func apply(diffOut io.Reader, edit func(addr string, data []byte) error) error {
-	scan := bufio.NewScanner(diffOut)
+	scan := &lineScanner{s: bufio.NewScanner(diffOut)}
 	var buf []byte
 	offset := 0
-	for scan.Scan() {
-		op, err := parseDiffOp(scan.Text())
+	for scan.scan() {
+		op, err := parseDiffOp(scan.text())
 		if err != nil {
 			return err
 		}
@@ -155,6 +168,7 @@ func apply(diffOut io.Reader, edit func(addr string, data []byte) error) error {
 			if err := eatLines(scan, "< ", op.n2-op.n1+1); err != nil {
 				return err
 			}
+			scan.skipNoNewline()
 		}
 		if op.op == 'c' {
 			if err := eatLines(scan, "---", 1); err != nil {
@@ -164,15 +178,18 @@ func apply(diffOut io.Reader, edit func(addr string, data []byte) error) error {
 		buf = buf[:0]
 		if op.op != 'd' {
 			for i := op.n3; i <= op.n4; i++ {
-				if !scan.Scan() {
+				if !scan.scan() {
 					return io.ErrUnexpectedEOF
 				}
-				line := scan.Bytes()
+				line := scan.bytes()
 				if !bytes.HasPrefix(line, []byte("> ")) {
 					return fmt.Errorf("expected line starting with '> ', got %q", line)
 				}
 				buf = append(buf, line[2:]...)
 				buf = append(buf, '\n')
+			}
+			if scan.skipNoNewline() {
+				buf = buf[:len(buf)-1]
 			}
 		}
 		var addr string
@@ -202,14 +219,14 @@ func apply(diffOut io.Reader, edit func(addr string, data []byte) error) error {
 	return nil
 }
 
-func eatLines(scan *bufio.Scanner, prefix string, n int) error {
+func eatLines(scan *lineScanner, prefix string, n int) error {
 	bprefix := []byte(prefix)
 	for i := 0; i < n; i++ {
-		if !scan.Scan() {
+		if !scan.scan() {
 			return io.ErrUnexpectedEOF
 		}
-		if !bytes.HasPrefix(scan.Bytes(), bprefix) {
-			return fmt.Errorf("line %q does not have expected prefix %q", scan.Bytes(), bprefix)
+		if !bytes.HasPrefix(scan.bytes(), bprefix) {
+			return fmt.Errorf("line %q does not have expected prefix %q", scan.bytes(), bprefix)
 		}
 	}
 	return nil
@@ -244,3 +261,32 @@ func atoi(s string) int {
 	}
 	return n
 }
+
+// lineScanner wraps bufio.Scanner with one-line pushback,
+// needed to handle diff's "\ No newline at end of file" markers.
+type lineScanner struct {
+	s       *bufio.Scanner
+	pending bool
+}
+
+func (s *lineScanner) scan() bool {
+	if s.pending {
+		s.pending = false
+		return true
+	}
+	return s.s.Scan()
+}
+
+func (s *lineScanner) unscan() {
+	s.pending = true
+}
+
+func (s *lineScanner) bytes() []byte {
+	return s.s.Bytes()
+}
+
+func (s *lineScanner) text() string {
+	return s.s.Text()
+}
+
+var noNewlineMarker = []byte(`\ No newline at end of file`)
